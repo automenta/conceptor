@@ -1,0 +1,467 @@
+%%%% Demo of aperture sweep
+
+%%% Experiment control
+randstate = 1; newNets = 1; newSystemScalings = 1;
+newChaosData = 1;
+
+%%% Setting system params
+Netsize = 500; % network size
+
+NetSR = 0.6; % spectral radius
+NetinpScaling = 1.2; % scaling of pattern feeding weights
+BiasScaling = 0.4; % size of bias
+
+
+%%% Weight learning
+TychonovAlphaEqui = .0001; % regularizer for equi weight training
+washoutLength = 500;
+learnLength = 2000; % for learning W and output weights
+TychonovAlphaReadout = 0.01;
+
+
+
+% Initializations for random numbers
+randn('state', randstate);
+rand('twister', randstate);
+
+% Create raw weights
+if newNets
+    if Netsize <= 20
+        Netconnectivity = 1;
+    else
+        Netconnectivity = 10/Netsize;
+    end
+    WinRaw = randn(Netsize, 2);
+    WstarRaw = generate_internal_weights(Netsize, Netconnectivity);
+    WbiasRaw = randn(Netsize, 1);
+end
+
+% Scale raw weights and initialize weights
+if newSystemScalings
+    Wstar = NetSR * WstarRaw;
+    Win = NetinpScaling * WinRaw;
+    Wbias = BiasScaling * WbiasRaw;
+end
+
+% Set pattern handles
+if newChaosData
+    patts = cell(1,4);
+    L = washoutLength + learnLength;
+    LorenzSeq = generateLorenzSequence2D(200, 15, L, 5000);
+    patts{2} = @(n) 2* LorenzSeq(:,n)-1;
+    RoesslerSeq =  generateRoesslerSequence2D(200, 150, L, 5000);
+    patts{1} = @(n) RoesslerSeq(:,n);
+    
+    MGSeq = generateMGSequence2D(17, 10, 3, L, 5000);
+    patts{3} = @(n) 2* MGSeq(:,n)-1;
+    HenonSeq = generateHenonSequence2D(L, 1000);
+    patts{4} = @(n) HenonSeq(:,n);
+    Np = 4;
+end
+
+% % learn equi weights
+
+% harvest data from network externally driven by patterns
+allTrainArgs = zeros(Netsize, Np * learnLength);
+allTrainOldArgs = zeros(Netsize, Np * learnLength);
+allTrainOuts = zeros(1, Np * learnLength);
+patternCollectors = cell(1,Np);
+xCollectorsCentered = cell(1,Np);
+xCollectors = cell(1,Np);
+patternRs = cell(1,Np);
+startXs = zeros(Netsize, Np);
+% collect data from driving native reservoir with different drivers
+for p = 1:Np
+    patt = patts{p}; % current pattern generator
+    xCollector = zeros(Netsize, learnLength );
+    xOldCollector = zeros(Netsize, learnLength );
+    pCollector = zeros(1, learnLength );
+    x = zeros(Netsize, 1);
+    for n = 1:(washoutLength + learnLength)
+        u = patt(n); % pattern input
+        xOld = x;
+        x = tanh(Wstar * x + Win * u + Wbias);
+        if n > washoutLength
+            xCollector(:, n - washoutLength ) = x;
+            xOldCollector(:, n - washoutLength ) = xOld;
+            if p == 2 || p == 3
+                % the Lorenz and MG observers are rescaled to [0 1]
+                % the other two are already in that range
+                pCollector(1, n - washoutLength) = 0.5*(u(1)+1);
+            else
+                pCollector(1, n - washoutLength) = u(1);
+            end
+        end
+    end
+    
+    xCollectorCentered = xCollector - ...
+        repmat( mean(xCollector,2),1,learnLength);
+    xCollectorsCentered{1,p} = xCollectorCentered;
+    xCollectors{1,p} = xCollector;
+    [Ux Sx Vx] = svd(xCollector * xCollector' / learnLength);
+    startXs(:,p) = x;
+    diagSx = diag(Sx);
+    %diagSx(diagSx < 1e-6,1) = zeros(sum(diagSx < 1e-6),1);
+    R = Ux * diag(diagSx) * Ux';
+    
+    patternRs{p} = R ;
+    patternCollectors{1,p} = pCollector;
+    allTrainArgs(:, (p-1)*learnLength+1:p*learnLength) = ...
+        xCollector;
+    allTrainOldArgs(:, (p-1)*learnLength+1:p*learnLength) = ...
+        xOldCollector;
+    allTrainOuts(1, (p-1)*learnLength+1:p*learnLength) = ...
+        pCollector;
+end
+
+
+%%% compute readout
+
+Wout = (inv(allTrainArgs * allTrainArgs' + ...
+    TychonovAlphaReadout * eye(Netsize)) ...
+    * allTrainArgs * allTrainOuts')';
+% training error
+NRMSE_readout = nrmse(Wout*allTrainArgs, allTrainOuts);
+disp(sprintf('NRMSE readout: %g', NRMSE_readout));
+
+%%% compute W
+Wtargets = (atanh(allTrainArgs) - repmat(Wbias,1,Np*learnLength));
+W = (inv(allTrainOldArgs * allTrainOldArgs' + ...
+    TychonovAlphaEqui * eye(Netsize)) * allTrainOldArgs * Wtargets')';
+% training errors per neuron
+NRMSE_W = nrmse(W*allTrainOldArgs, Wtargets);
+disp(sprintf('mean NRMSE W: %g', mean(NRMSE_W)));
+
+
+% % compute conceptors
+Cs = cell(1,Np);
+for p = 1:Np
+    R = patternRs{p};
+    [U S V] = svd(R);
+    Snew = (S * inv(S + eye(Netsize)));
+    C = U * Snew * U';
+    Cs{1, p} = C;
+end
+%%
+figure(10); clf;
+for p = 1:4
+    subplot(2,2,p);
+[U S V] = svd(patternRs{p});
+plot(log10(diag(S)));
+end
+
+
+%% Plotting sweeps through aperture
+
+
+%bestAlphas = [2000 80 350 300];
+%bestAlphas = [10^3 10^2.4 10^2.7 10^2.8];
+
+bestAlphas = [10^3 10^2.6 10^3.1 10^2.8];
+
+
+factorsShort =  [7 6.012 7 7];
+
+halfPlotNumberShort = 2;
+exponentsShort = -halfPlotNumberShort:halfPlotNumberShort;
+NalphasShort = 2*halfPlotNumberShort+1;
+allAlphasShort = zeros(4,NalphasShort);
+
+for i=1:NalphasShort
+    allAlphasShort(:,i) = ...
+        (bestAlphas').*(factorsShort'.^exponentsShort(i));
+end
+sigmaPL = zeros(NalphasShort, Netsize,4);
+%%
+testLengthes = 900*[1 1 1 1];
+plotLengthesDelayEmbed = 500*[1 1 1 1];
+delays = [2 2 3 1];
+
+%%
+    figure(7); clf;
+    set(gcf, 'WindowStyle','normal');
+    set(gcf, 'Position',[600 500 1200 200]);
+    
+    plotInd = 0;
+for p = [1 3 4]
+    plotInd = plotInd + 1;
+    
+    C = Cs{1, p};
+    testLength = testLengthes(p);
+    plotLengthDelayEmbed = plotLengthesDelayEmbed(p);
+    delay = delays(p);
+    alpha = allAlphasShort(p,3);
+    apSweepPL = zeros(1, testLength);
+    
+    
+        Calpha = PHI(C, alpha);
+        [U S V] = svd(Calpha);
+        sigmaPL(i,:,p) = diag(S)';
+        
+        x = startXs(:,p);
+        for n = 1:testLength
+            z = tanh(W *  x + Wbias);
+            x = Calpha * z;
+            apSweepPL(1,n) = Wout * x;            
+        end        
+    
+    
+    
+    
+        subplot('Position', ...
+            [(plotInd-1)*1/3, 0,1/6,1]);
+        if p == 4
+            plot(apSweepPL(1,1:plotLengthDelayEmbed), ...
+                apSweepPL(1,1+delay:plotLengthDelayEmbed+delay),'b.');
+        else
+            plot(apSweepPL(1,1:plotLengthDelayEmbed), ...
+                apSweepPL(1,1+delay:plotLengthDelayEmbed+delay), 'b',...
+                'MarkerSize',1);
+        end
+        rectangle('Position', [0.01, 0.85, 0.4 ,0.14],'FaceColor','w',...
+        'EdgeColor','none');
+    
+        text(0.05,0.93, num2str(alpha,2),'FontSize',18, ...
+            'FontWeight','bold');
+        
+        set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[] );
+    
+        
+        
+    subplot('Position', ...
+        [(plotInd-1)*1/3+1/6,  0,1/6,1]);
+    if p == 4
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'g.');
+    else
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'g','MarkerSize',1);
+    end
+    set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[]);
+end
+%%
+
+for p = 1:4
+    
+    C = Cs{1, p};
+    testLength = testLengthes(p);
+    plotLengthDelayEmbed = plotLengthesDelayEmbed(p);
+    delay = delays(p);
+    alphas = allAlphasShort(p,:);
+    apSweepPL = zeros(NalphasShort, testLength);
+    
+    quotaPL = zeros(1, NalphasShort);
+    for i = 1:NalphasShort
+        alpha = alphas(i);
+        Calpha = PHI(C, alpha);
+        [U S V] = svd(Calpha);
+        sigmaPL(i,:,p) = diag(S)';
+        
+        quotaPL(1,i) = trace(Calpha) / Netsize;
+        x = startXs(:,p);
+        for n = 1:testLength
+            z = tanh(W *  x + Wbias);
+            x = Calpha * z;
+            apSweepPL(i,n) = Wout * x;            
+        end        
+    end
+    
+    
+    figure(p); clf;
+    set(gcf, 'WindowStyle','normal');
+    set(gcf, 'Position',[900+(p-1)*50 200+(p-1)*100 600 400]);
+    
+    for i = 1:NalphasShort
+        subplot('Position', ...
+            [mod(i-1,3)/3, (-ceil(i/3)+2)/2,1/3,1/2]);
+        if p == 4
+            plot(apSweepPL(i,1:plotLengthDelayEmbed), ...
+                apSweepPL(i,1+delay:plotLengthDelayEmbed+delay),'.');
+        else
+            plot(apSweepPL(i,1:plotLengthDelayEmbed), ...
+                apSweepPL(i,1+delay:plotLengthDelayEmbed+delay), ...
+                'MarkerSize',1);
+        end
+        rectangle('Position', [0.01, 0.9, 0.48 ,0.08],'FaceColor','w',...
+        'EdgeColor','none');
+    rectangle('Position', [0.01, 0.8, 0.28 ,0.1],'FaceColor','w',...
+        'EdgeColor','none');
+        text(0.05,0.95, num2str(alphas(i),2),'FontSize',18, ...
+            'FontWeight','bold');
+        text(0.05,0.85, num2str(quotaPL(1,i),2), ...
+            'FontSize',18, 'FontWeight','bold'); 
+        
+        set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[] );
+    end
+    subplot('Position', ...
+        [mod(6-1,3)/3, (-ceil(6/3)+2)/2,1/3,1/2]);
+    if p == 4
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'g.');
+    else
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'g','MarkerSize',1);
+    end
+    set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[]);
+end
+%%
+
+for p = 2
+    
+    C = Cs{1, p};
+    testLength = testLengthes(p);
+    plotLengthDelayEmbed = plotLengthesDelayEmbed(p);
+    delay = delays(p);
+    alphas = allAlphasShort(p,:);
+    apSweepPL = zeros(NalphasShort, testLength);
+    
+    quotaPL = zeros(1, NalphasShort);
+    for i = 1:NalphasShort
+        alpha = alphas(i);
+        Calpha = PHI(C, alpha);
+        [U S V] = svd(Calpha);
+        sigmaPL(i,:,p) = diag(S)';
+        
+        quotaPL(1,i) = trace(Calpha) / Netsize;
+        x = startXs(:,p);
+        for n = 1:testLength
+            z = tanh(W *  x + Wbias);
+            x = Calpha * z;
+            apSweepPL(i,n) = Wout * x;            
+        end        
+    end
+    
+    
+    figure(5); clf;
+    set(gcf, 'WindowStyle','normal');
+    set(gcf, 'Position',[600 300 1200 200]);
+    
+    for i = 1:5
+        subplot('Position', ...
+            [mod(i-1,6)/6, 0,1/6,1]);
+        if p == 4
+            plot(apSweepPL(i,1:plotLengthDelayEmbed), ...
+                apSweepPL(i,1+delay:plotLengthDelayEmbed+delay),'k.');
+        else
+            plot(apSweepPL(i,1:plotLengthDelayEmbed), ...
+                apSweepPL(i,1+delay:plotLengthDelayEmbed+delay), 'b',...
+                'MarkerSize',1);
+        end
+        
+        text(0.05,0.93, num2str(alphas(i),2),'FontSize',24, ...
+            'FontWeight','bold');
+        
+        
+        set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[] );
+    end
+    subplot('Position', ...
+        [5/6, 0, 1/6,1]);
+    if p == 4
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'k.');
+    else
+        plot(patternCollectors{1,p}(1,end-plotLengthDelayEmbed:end-delay),...
+            patternCollectors{1,p}(1,end-plotLengthDelayEmbed+delay:end),...
+            'g','MarkerSize',1);
+    end
+    set(gca,'YLim',[0,1],'XLim',[0,1],'xtick',[],'ytick',[]);
+end
+
+%%
+
+
+
+%% Plotting attenuations
+
+testLengthesAtt = 200* [1 1 1 1];
+factors = 10^(2/8) * 0.8 * [1 1 1 1];
+
+halfPlotNumber = 10;
+exponents = -halfPlotNumber:halfPlotNumber;
+Nalphas = 2*halfPlotNumber+1;
+allAlphas = zeros(4,Nalphas);
+allQuotas = zeros(4,Nalphas);
+allNorms = zeros(4,Nalphas);
+attenuationPL = zeros(4,Nalphas);
+diffPL = zeros(4,Nalphas);
+zsPL = zeros(4,Nalphas);
+
+for i=1:Nalphas
+    allAlphas(:,i) = (bestAlphas').*(factors'.^exponents(i));
+end
+
+for p = 1:4
+    
+    C = Cs{1, p};    
+    testLength = testLengthesAtt(p);
+    delay = delays(p);
+    alphas = allAlphas(p,:);
+    Nalphas = size(alphas,2);
+    sigmaPL = zeros(Nalphas, Netsize);
+    for i = 1:Nalphas
+        alpha = alphas(i);
+        Calpha = PHI(C, alpha);
+        allQuotas(p,i) = trace(Calpha) / Netsize;
+        allNorms(p,i) = norm(Calpha,'fro')^2;
+        [U S V] = svd(Calpha);
+        sigmaPL(i,:) = diag(S)';
+        x = startXs(:,p);
+        att = 0; diff = 0; zs = 0;
+        for n = 1:testLength
+            z = tanh(W *  x + Wbias);
+            x = Calpha * z;
+            att = att + norm(x-z)^2 / norm(z)^2;
+            zs = zs + norm(z)^2;
+            diff = diff + norm(x-z)^2;
+        end
+        attenuationPL(p,i) = att / testLength;
+        diffPL(p,i) = diff / testLength;
+        zsPL(p,i) = zs / testLength;
+    end
+    
+  
+end
+%%
+figure(6); clf;
+set(gcf, 'WindowStyle','normal');
+set(gcf, 'Position',[700 200 1000 180]);
+fs = 18;
+yValuesForDots = -4 * [1 1 1 1];
+plotInd = 0;
+for p = [2 1 3 4]
+plotInd = plotInd + 1;
+subplot(1,4,plotInd);
+hold on;
+plot(log10(allAlphas(p,:)), log10(diffPL(p,:)./zsPL(p,:)), 'k', ...
+    'LineWidth',2);
+if p == 2
+plot(log10(allAlphasShort(p,:)), yValuesForDots(p) * ones(1,5), '.', ...
+    'MarkerSize',35, 'Color',0.6 * [1 1 1]);
+else
+    plot(log10(allAlphasShort(p,3)), yValuesForDots(p) , '.', ...
+    'MarkerSize',35, 'Color',0.6 * [1 1 1]);
+end
+hold off;
+set(gca, 'Box','on', 'FontSize',fs,...
+    'XLim', [1 5], 'XTick', 1:5,'YLim', [-8 0]);
+
+if p == 1
+    title('Roessler');
+elseif p == 2
+    title('Lorenz');
+    xlabel('log10 aperture');
+elseif p == 3
+    title('Mackey-Glass');
+    
+    %ylabel('log10 attenuation');
+else
+    title('Hénon');
+end
+end
+
+%%
