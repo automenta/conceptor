@@ -26,7 +26,7 @@ H. Jaeger (2014): Controlling Recurrent Neural Networks by Conceptors. Jacobs Un
  * http://minds.jacobs-university.de/sites/default/files/uploads/SW/ConceptorsTechrepMatlab.zip
  
  
- Source Code
- ===========
- Contains original MatLab source code, automatic Matlab -> Python translation, and other derivatives.
+Source Code
+===========
+Contains original MatLab source code, automatic Matlab -> Python translation, and other derivatives.
  
